@@ -1,0 +1,25 @@
+# EditorConfig: shared editor settings that live in Git, not in one IDE.
+# https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{md,markdown}]
+indent_size = 2
+# Two trailing spaces are a hard line break in Markdown; keep them.
+trim_trailing_whitespace = false
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[{Makefile,*.mk}]
+indent_style = tab
+
+[*.sh]
+indent_size = 2

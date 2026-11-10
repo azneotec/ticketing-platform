@@ -1,0 +1,7 @@
+# Local secrets: never commit. Copy .env.example to .env (make does it for you).
+.env
+# macOS
+.DS_Store
+# IntelliJ
+.idea/
+*.iml

@@ -1,0 +1,150 @@
+# Local platform for the ticketing services: Postgres, Kafka, observability.
+# Start with `make up` (profiles core + messaging). See README.md for ports and concepts.
+#
+# Rules (ADR-027): pinned image versions, a memory limit on every container, ports bound to
+# 127.0.0.1 only, and profiles so only what the current task needs is running.
+name: ticketing
+
+services:
+  # One shared Postgres container, one database + login per service (ADR-028).
+  postgres:
+    image: postgres:18.6-alpine
+    profiles: [core]
+    container_name: ticketing-postgres
+    mem_limit: 512m
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set it in .env (copy .env.example)}
+      CATALOGUE_DB_PASSWORD: ${CATALOGUE_DB_PASSWORD:?set it in .env}
+      INVENTORY_DB_PASSWORD: ${INVENTORY_DB_PASSWORD:?set it in .env}
+      BOOKING_DB_PASSWORD: ${BOOKING_DB_PASSWORD:?set it in .env}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD:?set it in .env}
+    # Tuned small for a laptop: Postgres's own memory stays well under the 512 MB limit.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB # page cache inside Postgres (default 128MB)
+      - -c
+      - effective_cache_size=192MB # planner hint only, allocates nothing
+      - -c
+      - work_mem=4MB # per sort/hash operation
+      - -c
+      - maintenance_work_mem=32MB # VACUUM, CREATE INDEX
+      - -c
+      - max_connections=60 # 4 services x small Hikari pools + tools
+      - -c
+      - wal_level=logical # needed later for Debezium CDC (Phase 3); costs nothing now
+    volumes:
+      # Postgres 18 images keep data under /var/lib/postgresql/18/docker; mount the parent.
+      - postgres-data:/var/lib/postgresql
+      # Runs once, only when the data volume is empty (first start or after `make reset`).
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [ticketing]
+
+  # Single Kafka node in KRaft mode: one process is both controller and broker.
+  kafka:
+    image: apache/kafka:4.4.0
+    profiles: [messaging]
+    container_name: ticketing-kafka
+    mem_limit: 1g
+    environment:
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+      CLUSTER_ID: wBk3BJwDSkaqf5-d04zR4A # fixed so the volume can be reused after a restart
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Three listeners (sockets the broker opens):
+      #  INTERNAL  :19092  other containers, advertised as kafka:19092 (Docker DNS name)
+      #  EXTERNAL  :9092   the Mac host, advertised as localhost:9092 (published port)
+      #  CONTROLLER :9093  KRaft controller traffic, never published
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_NUM_PARTITIONS: 3
+      # One broker, so every internal topic can only have one copy.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      - "127.0.0.1:9092:9092"
+    healthcheck:
+      # A real Kafka API call, with a tiny heap so the check fits next to the broker.
+      test:
+        - CMD-SHELL
+        - KAFKA_HEAP_OPTS=-Xmx64m /opt/kafka/bin/kafka-cluster.sh api-versions --bootstrap-server kafka:19092 >/dev/null 2>&1
+      interval: 20s
+      timeout: 15s
+      retries: 5
+      start_period: 30s
+    networks: [ticketing]
+
+  # Grafana + Loki (logs) + Tempo (traces) + Prometheus (metrics) + Pyroscope (profiles)
+  # behind one OpenTelemetry Collector, in one container (ADR-007).
+  otel-lgtm:
+    image: grafana/otel-lgtm:0.40.0
+    profiles: [core]
+    container_name: ticketing-otel-lgtm
+    mem_limit: 1536m
+    volumes:
+      - otel-lgtm-data:/data
+    ports:
+      - "127.0.0.1:3000:3000" # Grafana UI
+      - "127.0.0.1:4317:4317" # OTLP over gRPC
+      - "127.0.0.1:4318:4318" # OTLP over HTTP
+    healthcheck:
+      # The image's own check (passes once every component reports ready).
+      test: ["CMD", "/otel-lgtm/docker/healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    networks: [ticketing]
+
+  # Web UI for browsing Kafka topics and messages. Optional: `make tools`.
+  kafbat-ui:
+    image: kafbat/kafka-ui:v1.5.0
+    profiles: [tools]
+    container_name: ticketing-kafbat-ui
+    mem_limit: 384m
+    environment:
+      JAVA_OPTS: -Xmx192m -XX:MaxMetaspaceSize=128m
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
+      DYNAMIC_CONFIG_ENABLED: "false"
+    ports:
+      - "127.0.0.1:8089:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks: [ticketing]
+
+networks:
+  ticketing:
+    name: ticketing
+
+volumes:
+  postgres-data:
+  kafka-data:
+  otel-lgtm-data:
